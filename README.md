@@ -30,7 +30,7 @@ Allocations larger than 1024 bytes fall through to the system allocator.
 
 - **O(1) alloc/dealloc** — just a linked list pop/push per operation
 - **Zero metadata overhead** — free list pointers live inside unused slots
-- **Thread-safe** — protected by a `Mutex` (swap for a spinlock in `no_std`)
+- **Thread-safe** — protected by an atomic spin lock (re-entrancy safe)
 - **Configurable size classes** — easily adjust slot sizes and slab page size
 - **System fallback** — large allocations transparently use the system allocator
 - **Drop-in replacement** — implements `GlobalAlloc`, works with `#[global_allocator]`
@@ -63,7 +63,6 @@ slab-alloc/
 ├── src/
 │   └── main.rs         # Full allocator implementation
 ├── Cargo.toml
-├── LICENSE
 └── README.md
 ```
 
@@ -71,7 +70,7 @@ slab-alloc/
 
 ### `SlabAllocator` (top level)
 
-The global allocator entry point. Wraps all internals in a `Mutex` for thread safety and lazily initializes on first allocation. Routes each request to the appropriate size class based on the requested `Layout`.
+The global allocator entry point. Protects all internals with an atomic spin lock for thread safety and re-entrancy. Size classes are const-initialized at compile time. Routes each request to the appropriate size class based on the requested `Layout`. Falls back to the system allocator if the lock is already held (re-entrant call) or the request exceeds the largest size class.
 
 ### `SizeClass`
 
@@ -108,14 +107,14 @@ Requests are rounded up to the nearest size class. Anything exceeding the larges
 | Deallocation speed | O(n) slabs per class | Linear scan to find owning slab |
 | Internal fragmentation | Up to 2× | Rounding up to next size class |
 | External fragmentation | None within a class | Slots are uniform |
-| Thread safety | Mutex-based | Single global lock |
+| Thread safety | Atomic spin lock | Re-entrancy safe with system fallback |
 | Large allocations | System fallback | Not slab-managed |
 
 ## Potential Enhancements
 
 - **Slab reclamation** — return fully-empty slabs to the system to reduce memory footprint
 - **Per-CPU / per-thread caches** — eliminate lock contention (à la Linux SLUB)
-- **`no_std` support** — replace `Mutex` with a spinlock and the system fallback with a custom page allocator
+- **`no_std` support** — replace the system fallback with a custom page allocator
 - **Allocation statistics** — track per-class usage, peak counts, and fragmentation ratios
 - **Slab coloring** — offset slot starts to reduce cache line conflicts ([Bonwick, 1994](https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps))
 - **HashMap-based dealloc** — O(1) pointer → slab lookup instead of linear scan

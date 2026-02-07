@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
-use std::alloc::{GloabalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 //
 // Configuration
@@ -14,7 +15,7 @@ const SLAB_SIZE: usize = 4096;
 // This supports three classes. Any request gets rounded up to the 
 // nearest class. Requests larger than the biggest class fall back 
 // to the system allocator
-const SIZE_CLASSES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024];
+const SIZE_CLASSES: [usize; 8] = [8, 16, 32, 64, 128, 256, 512, 1024];
 
 // 
 // Free-slot node (intrusive linked list inside each free slot)
@@ -52,24 +53,24 @@ impl Slab {
     unsafe fn new(slot_size: usize) -> *mut Slab {
         // Allocate the slab metadata itself 
         let slab_layout = Layout::new::<Slab>();
-        let slab_ptr = std::alloc::alloc(slab_layout) as *mut Slab;
+        let slab_ptr = System.alloc(slab_layout) as *mut Slab;
         if slab_ptr.is_null() {
             return ptr::null_mut();
         }
 
         // Allocate the backing memory for slots 
-        let backing_layout - Layout::from_size_align(SLAB_SIZE, slot_size)
+        let backing_layout = Layout::from_size_align(SLAB_SIZE, slot_size)
             .expect("invalid layout");
-        let base = std::alloc::alloc(backing_layout);
+        let base = System.alloc(backing_layout);
         if base.is_null() {
-            std::alloc::dealloc(slab_ptr as *mut u8, slab_layout);
+            System.dealloc(slab_ptr as *mut u8, slab_layout);
             return ptr::null_mut();
         }
 
         let total_slots = SLAB_SIZE / slot_size;
 
         // Build the free list by chaining every slot together 
-        let mut head *mut FreeNode = ptr::null_mut();
+        let mut head: *mut FreeNode = ptr::null_mut();
         for i in (0..total_slots).rev() {
             let slot = base.add(i * slot_size) as *mut FreeNode;
             (*slot).next = head;
@@ -178,32 +179,45 @@ impl SizeClass {
 //
 
 struct SlabAllocatorInner {
-    size_classes: Vec<SizeClass>,
+    size_classes: [SizeClass; 8],
+    initialized: bool,
 }
 
 pub struct SlabAllocator {
-    inner: Mutex<Option<SlabAllocatorInner>>,
+    lock: AtomicBool,
+    inner: UnsafeCell<SlabAllocatorInner>,
 }
 
 impl SlabAllocator {
     pub const fn new() -> Self {
         SlabAllocator {
-            inner: Mutex::new(None),
+            lock: AtomicBool::new(false),
+            inner: UnsafeCell::new(SlabAllocatorInner {
+                size_classes: [
+                    SizeClass { slot_size: 8, head: ptr::null_mut() },
+                    SizeClass { slot_size: 16, head: ptr::null_mut() },
+                    SizeClass { slot_size: 32, head: ptr::null_mut() },
+                    SizeClass { slot_size: 64, head: ptr::null_mut() },
+                    SizeClass { slot_size: 128, head: ptr::null_mut() },
+                    SizeClass { slot_size: 256, head: ptr::null_mut() },
+                    SizeClass { slot_size: 512, head: ptr::null_mut() },
+                    SizeClass { slot_size: 1024, head: ptr::null_mut() },
+                ],
+                initialized: true,
+            }),
         }
     }
 
-    // Lazily initialize size classes (can't allocate in a const fn).
-    fn get_inner(&self) -> std::sync::MutexGuard<'_, Option<SlabAllcatorInner>> {
-        let mut guard = self.inner.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(SlabAllocatorInner {
-                size_classes: SIZE_CLASSES 
-                    .iter()
-                    .map(|&size| SizeClass::new(size))
-                    .collect(),
-            });
-        }
-        guard 
+    // Try to acquire the spin lock. Returns false if already held
+    // (re-entrancy or contention).
+    fn try_lock(&self) -> bool {
+        self.lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn unlock(&self) {
+        self.lock.store(false, Ordering::Release);
     }
 
     // Find the index of the size class that fits 'size'.
@@ -212,23 +226,48 @@ impl SlabAllocator {
     }
 }
 
-unsafe impl GloabalAlloc for SlabAllocator {
+unsafe impl GlobalAlloc for SlabAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size().max(layout.align());
 
-        // If too large for our size classes, fall back to system 
+        // If too large for our size classes, fall back to system
         let Some(idx) = Self::class_index(size) else {
-            // Was allocated by the system allocator 
-            std::alloc::dealloc(ptr, layout);
+            return System.alloc(layout);
+        };
+
+        // If we can't get the lock (re-entrancy), fall back to system
+        if !self.try_lock() {
+            return System.alloc(layout);
+        }
+
+        let inner = &mut *self.inner.get();
+        let result = inner.size_classes[idx].alloc();
+        self.unlock();
+        result
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let size = layout.size().max(layout.align());
+
+        // If too large for our size classes, fall back to system
+        let Some(idx) = Self::class_index(size) else {
+            System.dealloc(ptr, layout);
             return;
         };
 
-        let mut guard = self.get_inner();
-        let inner = guard.as_mut().unwrap();
-        if !inner.size_classes[idx].dealloc(ptr) {
-            // Shouldn't happen, but fall back just in case 
-            std::alloc::dealloc(ptr, layout);
+        // If we can't get the lock (re-entrancy), the pointer must have
+        // come from a System fallback during a re-entrant alloc.
+        if !self.try_lock() {
+            System.dealloc(ptr, layout);
+            return;
         }
+
+        let inner = &mut *self.inner.get();
+        if !inner.size_classes[idx].dealloc(ptr) {
+            // Pointer wasn't in any slab -- was allocated by system fallback
+            System.dealloc(ptr, layout);
+        }
+        self.unlock();
     }
 }
 
@@ -250,7 +289,7 @@ fn main() {
     }
     println!("Allocated vec with {} elements via slab allocator", v.len());
 
-    let s = String::form("Hello form the slab allcator!");
+    let s = String::from("Hello from the slab allocator!");
     println!("{s}");
 
     let boxed = Box::new([0u8; 256]);
